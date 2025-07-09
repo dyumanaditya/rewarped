@@ -747,6 +747,7 @@ def run_env(Demo, **kwargs):
         try:
             steps_per_second = demo.run()
             print(f"envs: {demo.num_envs} | steps/second: {steps_per_second}")
+            demo.plotter.plot()
         except KeyboardInterrupt:
             if demo.renderer is not None:
                 demo.renderer.save()
