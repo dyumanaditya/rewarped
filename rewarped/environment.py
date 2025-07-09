@@ -19,7 +19,7 @@ import warp as wp
 import warp.sim
 import warp.sim.render
 
-from .warp_utils import eval_kinematic_fk
+from .warp_utils import sim_update_inplace
 
 
 class RenderMode(Enum):
@@ -35,6 +35,7 @@ class IntegratorType(Enum):
     EULER = "euler"
     FEATHERSTONE = "featherstone"
     XPBD = "xpbd"
+    VBD = "vbd"
     MPM = "mpm"
 
     def __str__(self):
@@ -108,10 +109,15 @@ class Environment:
     sim_substeps_euler: int = 16
     sim_substeps_featherstone: int = 16
     sim_substeps_xpbd: int = 5
+    sim_substeps_vbd: int = 5
     sim_substeps_mpm: int = 16
 
-    euler_settings = dict(angular_damping=0.05)
-    featherstone_settings = dict(angular_damping=0.05, update_mass_matrix_every=sim_substeps_featherstone)
+    euler_settings = dict(angular_damping=0.05, friction_smoothing=1.0)
+    featherstone_settings = dict(
+        angular_damping=0.05,
+        update_mass_matrix_every=sim_substeps_featherstone,
+        friction_smoothing=1.0,
+    )
     xpbd_settings = dict(
         iterations=2,
         soft_body_relaxation=0.9,
@@ -122,6 +128,17 @@ class Environment:
         rigid_contact_con_weighting=True,
         angular_damping=0.0,
         enable_restitution=False,
+    )
+    vbd_settings = dict(
+        iterations=10,
+        handle_self_contact=False,
+        penetration_free_conservative_bound_relaxation=0.42,
+        friction_epsilon=1e-2,
+        body_particle_contact_buffer_pre_alloc=4,
+        vertex_collision_buffer_pre_alloc=32,
+        edge_collision_buffer_pre_alloc=64,
+        triangle_collision_buffer_pre_alloc=32,
+        edge_edge_parallel_epsilon=1e-5,
     )
     mpm_settings = dict()
 
@@ -135,8 +152,8 @@ class Environment:
 
     # whether to apply model.joint_q, joint_qd to bodies before simulating
     eval_fk: bool = True
-    # whether to set state.body_q based on state.joint_q
-    kinematic_fk: bool = False
+    # whether to directly set state.body_q based on state.joint_q
+    eval_kinematic_fk: bool = False
     # whether to update state.joint_q, state.joint_qd
     eval_ik: bool = False
 
@@ -169,6 +186,7 @@ class Environment:
     separate_collision_group_per_env: bool = True
 
     asset_dir = os.path.join(os.path.dirname(__file__), "assets")
+    data_dir = os.path.join(os.path.dirname(__file__), "data")
     render_dir = None
 
     def __init__(self):
@@ -189,7 +207,7 @@ class Environment:
         if not self.model.device.is_cuda:
             self.use_graph_capture = False
 
-        self.sim_substeps, self.integrator = self.create_integrator(self.model)
+        self.sim_substeps, self.integrator_settings, self.integrator = self.create_integrator(self.model)
 
         self.episode_frames = int(self.episode_duration / self.frame_dt)
         self.sim_dt = self.frame_dt / self.sim_substeps
@@ -293,6 +311,7 @@ class Environment:
             particle_adhesion=0.0,
             particle_max_velocity=1e5,
             # Default soft contact settings
+            soft_contact_radius=0.2,
             soft_contact_margin=0.2,
             soft_contact_ke=1.0e3,
             soft_contact_kd=10.0,
@@ -309,19 +328,27 @@ class Environment:
     def create_integrator(self, model):
         if self.integrator_type == IntegratorType.EULER:
             sim_substeps = self.sim_substeps_euler
-            integrator = wp.sim.SemiImplicitIntegrator(**self.euler_settings)
+            integrator_settings = self.euler_settings
+            integrator = wp.sim.SemiImplicitIntegrator(**integrator_settings)
         elif self.integrator_type == IntegratorType.FEATHERSTONE:
             sim_substeps = self.sim_substeps_featherstone
-            integrator = wp.sim.FeatherstoneIntegrator(model, **self.featherstone_settings)
+            integrator_settings = self.featherstone_settings
+            integrator = wp.sim.FeatherstoneIntegrator(model, **integrator_settings)
         elif self.integrator_type == IntegratorType.XPBD:
             sim_substeps = self.sim_substeps_xpbd
-            integrator = wp.sim.XPBDIntegrator(**self.xpbd_settings)
+            integrator_settings = self.xpbd_settings
+            integrator = wp.sim.XPBDIntegrator(**integrator_settings)
+        elif self.integrator_type == IntegratorType.VBD:
+            sim_substeps = self.sim_substeps_vbd
+            integrator_settings = self.vbd_settings
+            integrator = wp.sim.VBDIntegrator(model, **integrator_settings)
         elif self.integrator_type == IntegratorType.MPM:
             sim_substeps = self.sim_substeps_mpm
-            integrator = wp.sim.MPMIntegrator(model, **self.mpm_settings)
+            integrator_settings = self.mpm_settings
+            integrator = wp.sim.MPMIntegrator(model, **integrator_settings)
         else:
             raise NotImplementedError(self.integrator_type)
-        return sim_substeps, integrator
+        return sim_substeps, integrator_settings, integrator
 
     def create_renderer(self):
         if self.render_dir is not None:
@@ -381,26 +408,20 @@ class Environment:
         return self.control_0
 
     def update(self):
-        control = self.control_0
-        for i in range(self.sim_substeps):
-            if self.kinematic_fk:
-                eval_kinematic_fk(self.model, self.state_0, self.state_1, self.sim_dt, self.sim_substeps, control)
-
-            self.state_0.clear_forces()
-            wp.sim.collide(self.model, self.state_0)
-            self.integrator.simulate(self.model, self.state_0, self.state_1, self.sim_dt, control=control)
-            self.state_0, self.state_1 = self.state_1, self.state_0
-
-        if self.eval_ik:
-            wp.sim.eval_ik(self.model, self.state_0, self.state_0.joint_q, self.state_0.joint_qd)
+        sim_params = (self.integrator, self.sim_substeps, self.sim_dt, self.eval_kinematic_fk, self.eval_ik)
+        self.state_0, self.state_1 = sim_update_inplace(
+            sim_params,
+            self.model,
+            (self.state_0, self.state_1),
+            self.control_0,
+        )
 
     def render(self, state=None):
         if self.renderer is not None:
             with wp.ScopedTimer("render", False):
                 self.render_time += self.frame_dt
                 self.renderer.begin_frame(self.render_time)
-                # render state 1 (swapped with state 0 just before)
-                self.renderer.render(state or self.state_1)
+                self.renderer.render(state or self.state_0)
                 self.renderer.end_frame()
 
     def print_model_info(self):
@@ -471,6 +492,9 @@ class Environment:
             # print("particle_qd", self.model.particle_qd.numpy())
             # print("particle_mass", self.model.particle_mass.numpy())
             # print("particle_radius", self.model.particle_radius.numpy())
+            print("edge_count", self.model.edge_count)
+            print("tri_count", self.model.tri_count)
+            print("spring_count", self.model.spring_count)
         print()
 
     def parse_args(self):
